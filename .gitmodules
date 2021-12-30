@@ -1,0 +1,10 @@
+[submodule "third_party/FreeRTOS"]
+	path = third_party/FreeRTOS
+	url = https://github.com/FreeRTOS/FreeRTOS-Kernel.git
+	branch = smp
+[submodule "third_party/pico-sdk"]
+	path = third_party/pico-sdk
+	url = https://github.com/raspberrypi/pico-sdk.git
+[submodule "third_party/oofatfs"]
+	path = third_party/oofatfs
+	url = https://github.com/micropython/oofatfs.git
