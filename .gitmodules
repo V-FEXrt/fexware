@@ -6,5 +6,5 @@
 	path = third_party/pico-sdk
 	url = https://github.com/raspberrypi/pico-sdk.git
 [submodule "third_party/oofatfs"]
-	path = third_party/oofatfs
+	path = third_party/ooFatFs
 	url = https://github.com/micropython/oofatfs.git
