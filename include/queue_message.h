@@ -34,6 +34,12 @@ namespace fex
         int8_t mouse_delta;
         uint8_t mouse_click;
     } QueueMessage;
+
+    typedef struct KeyMessage
+    {
+        uint8_t keys[10];
+        uint32_t time;
+    } KeyMessage;
 }
 
 #endif

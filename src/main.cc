@@ -34,8 +34,9 @@
 
 /* Task Stack Sizes */
 #define USB_DEVICE_STACK_SIZE (3 * configMINIMAL_STACK_SIZE / 2) * (CFG_TUSB_DEBUG ? 2 : 1)
-#define USB_HID_STACK_SIZE (configMINIMAL_STACK_SIZE)
+#define USB_HID_STACK_SIZE (512)
 #define POLL_KEYS_STACK_SIZE (512)
+#define PROCESS_KEYS_STACK_SIZE (512 * 2)
 #define DRAW_DISPLAYS_STACK_SIZE (512)
 #define BLINK_STACK_SIZE (configMINIMAL_STACK_SIZE)
 
@@ -43,21 +44,22 @@
 #define USB_DEVICE_TASK_PRIORITY (configMAX_PRIORITIES - 1)
 #define USB_HID_TASK_PRIORITY (configMAX_PRIORITIES - 2)
 #define POLL_KEYS_TASK_PRIORITY (configMAX_PRIORITIES - 3)
+#define PROCESS_KEYS_TASK_PRIORITY (configMAX_PRIORITIES - 3)
 #define DRAW_DISPLAYS_TASK_PRIORITY (configMAX_PRIORITIES - 4)
 #define BLINK_TASK_PRIORITY (tskIDLE_PRIORITY)
 
 /* Task Periods */
 
-// USB Device task doesn't have a period, it loops
-// as fast as it can and blocks on an empty queue
 // #define USB_DEVICE_TASK_PERIOD
 #define USB_HID_TASK_PERIOD (10 / portTICK_PERIOD_MS)
 #define POLL_KEYS_TASK_PERIOD (10 / portTICK_PERIOD_MS)
+// #define PROCESS_KEYS_TASK_PERIOD
 #define DRAW_DISPLAYS_TASK_PERIOD (500 / portTICK_PERIOD_MS)
 #define BLINK_TASK_PERIOD (1000 / portTICK_PERIOD_MS)
 
 /* Application Constants */
-#define MESSAGE_QUEUE_LENGTH (1)
+#define EVENT_QUEUE_LENGTH (100)
+#define KEY_QUEUE_LENGTH (100)
 #define BLINK_TASK_LED (PICO_DEFAULT_LED_PIN)
 #define CORE_0_AFFINITY_MASK (1 << 0)
 #define CORE_1_AFFINITY_MASK (1 << 1)
@@ -97,6 +99,7 @@ static void prvHardwareInit(void);
 static void prvUsbDeviceTask(void *pvParameters);
 static void prvUsbHidTask(void *pvParameters);
 static void prvPollKeysTask(void *pvParameters);
+static void prvProcessKeysTask(void *pvParameters);
 static void prvDrawDisplaysTask(void *pvParameters);
 static void prvBlinkTask(void *pvParameters);
 
@@ -114,7 +117,8 @@ std::unordered_map<int, std::pair<std::string, fex::Layer>> layers;
 // OLED and Expander task both use I2C, should be mutexed
 SemaphoreHandle_t xI2CMutex;
 
-QueueHandle_t xMessageQueue;
+QueueHandle_t xEventQueue;
+QueueHandle_t xKeyQueue;
 
 // Should probably be a mutex, but I think a bool works for now
 bool hid_send_complete = true;
@@ -198,19 +202,28 @@ int main(void)
     return 1;
   }
 
-  xMessageQueue = xQueueCreate(100, sizeof(fex::QueueMessage));
-  if (xMessageQueue == NULL)
+  xEventQueue = xQueueCreate(EVENT_QUEUE_LENGTH, sizeof(fex::QueueMessage));
+  if (xEventQueue == NULL)
   {
-    printf("---- FAILED TO CREATE QUEUE ----\n");
+    printf("---- FAILED TO CREATE EVENT QUEUE ----\n");
+    return 1;
+  }
+
+  xKeyQueue = xQueueCreate(KEY_QUEUE_LENGTH, sizeof(fex::KeyMessage));
+  if (xKeyQueue == NULL)
+  {
+    printf("---- FAILED TO CREATE KEY QUEUE ----\n");
     return 1;
   }
 
   // TODO(fex): pressing a key twice will sometimes miss a press
   TaskHandle_t poll_keys_handle;
+  TaskHandle_t process_keys_handle;
   TaskHandle_t draw_displays_handle;
   TaskHandle_t blink_handle;
   xTaskCreate(prvPollKeysTask, "poll_keys", POLL_KEYS_STACK_SIZE, NULL, POLL_KEYS_TASK_PRIORITY, &poll_keys_handle);
-  xTaskCreate(prvDrawDisplaysTask, "draw_displays", DRAW_DISPLAYS_STACK_SIZE, NULL, DRAW_DISPLAYS_TASK_PRIORITY, &draw_displays_handle);
+  xTaskCreate(prvProcessKeysTask, "process_keys", PROCESS_KEYS_STACK_SIZE, NULL, PROCESS_KEYS_TASK_PRIORITY, &process_keys_handle);
+  // xTaskCreate(prvDrawDisplaysTask, "draw_displays", DRAW_DISPLAYS_STACK_SIZE, NULL, DRAW_DISPLAYS_TASK_PRIORITY, &draw_displays_handle);
   xTaskCreate(prvBlinkTask, "blink", BLINK_STACK_SIZE, NULL, BLINK_TASK_PRIORITY, &blink_handle);
 
   TaskHandle_t usb_d_handle = xTaskCreateStatic(prvUsbDeviceTask, "usb_device", USB_DEVICE_STACK_SIZE, NULL, USB_DEVICE_TASK_PRIORITY, usb_device_task_stack, &usb_device_task);
@@ -221,7 +234,8 @@ int main(void)
   vTaskCoreAffinitySet(usb_d_handle, CORE_0_AFFINITY_MASK);
   vTaskCoreAffinitySet(usb_hid_handle, CORE_0_AFFINITY_MASK);
   vTaskCoreAffinitySet(poll_keys_handle, CORE_0_AFFINITY_MASK);
-  vTaskCoreAffinitySet(draw_displays_handle, CORE_1_AFFINITY_MASK);
+  vTaskCoreAffinitySet(process_keys_handle, CORE_1_AFFINITY_MASK);
+  // vTaskCoreAffinitySet(draw_displays_handle, CORE_1_AFFINITY_MASK);
   vTaskCoreAffinitySet(blink_handle, CORE_1_AFFINITY_MASK);
 
   vTaskStartScheduler();
@@ -255,13 +269,7 @@ static void prvPollKeysTask(void *pvParameters)
 
   const uint8_t LEFT_ADDRESS = 0x23;
   const uint8_t RIGHT_ADDRESS = 0x27;
-
-  // init i2c
-  i2c_init(i2c1, 400 * 1000);
-  gpio_set_function(6, GPIO_FUNC_I2C);
-  gpio_set_function(7, GPIO_FUNC_I2C);
-  gpio_pull_up(6);
-  gpio_pull_up(7);
+  uint8_t msg[1] = {REG_IP0};
 
   xSemaphoreTake(xI2CMutex, portMAX_DELAY);
 
@@ -284,6 +292,32 @@ static void prvPollKeysTask(void *pvParameters)
   }
 
   xSemaphoreGive(xI2CMutex);
+
+  while (true)
+  {
+    xTaskDelayUntil(&nextWake, POLL_KEYS_TASK_PERIOD);
+    fex::KeyMessage key;
+
+    xSemaphoreTake(xI2CMutex, portMAX_DELAY);
+
+    i2c_write_blocking(i2c1, LEFT_ADDRESS, msg, 1, false);
+    int num_bytes_read = i2c_read_blocking(i2c1, LEFT_ADDRESS, key.keys, 5, false);
+    i2c_write_blocking(i2c1, RIGHT_ADDRESS, msg, 1, false);
+    num_bytes_read = i2c_read_blocking(i2c1, RIGHT_ADDRESS, key.keys + 5, 5, false);
+
+    xSemaphoreGive(xI2CMutex);
+
+    key.time = xTaskGetTickCount();
+
+    xQueueSend(xKeyQueue, (void *)&key, 0);
+  }
+}
+
+/*-----------------------------------------------------------*/
+
+static void prvProcessKeysTask(void *pvParameters)
+{
+  printf("Starting Process Keys Task...\n");
 
   const int width = 12;
   int keys[] = {
@@ -370,37 +404,36 @@ static void prvPollKeysTask(void *pvParameters)
   };
 
   int64_t timeouts[80];
-  memset(timeouts, -1, sizeof(int64_t) * 80);
+  memset(timeouts, -1, sizeof(timeouts));
   TickType_t hold = pdMS_TO_TICKS(200);
 
-  uint8_t msg[1] = {REG_IP0};
   uint8_t previous[10];
   uint8_t current[10];
   memset(previous, 0xFF, 10);
-  memset(current, 0xFF, 10);
   while (true)
   {
-    xTaskDelayUntil(&nextWake, POLL_KEYS_TASK_PERIOD);
+    fex::KeyMessage key;
+    if (xQueueReceive(xKeyQueue, (void *)&key, portMAX_DELAY) != pdTRUE)
+    {
+      continue;
+    }
 
-    xSemaphoreTake(xI2CMutex, portMAX_DELAY);
 
-    i2c_write_blocking(i2c1, LEFT_ADDRESS, msg, 1, false);
-    int num_bytes_read = i2c_read_blocking(i2c1, LEFT_ADDRESS, current, 5, false);
-    i2c_write_blocking(i2c1, RIGHT_ADDRESS, msg, 1, false);
-    num_bytes_read = i2c_read_blocking(i2c1, RIGHT_ADDRESS, current + 5, 5, false);
-
-    xSemaphoreGive(xI2CMutex);
-
-    TickType_t now = xTaskGetTickCount();
+    TickType_t now = key.time;
+    memcpy(current, key.keys, 10);
 
     for (int i = 0; i < 10; i++)
     {
       for (int j = 0; j < 8; j++)
       {
-        if (layers[layer].second.Bound(keys[i * 8 + j], fex::Operation::HOLD) && timeouts[i * 8 + j] != -1 && now - timeouts[i * 8 + j] > hold)
+        // volatile int x = i * 8 + j;
+        // printf("%d\n", x);
+        if (layers[layer].second.Bound(keys[i * 8 + j], fex::Operation::HOLD) 
+        && timeouts[i * 8 + j] != -1 
+        && now - timeouts[i * 8 + j] > hold)
         {
           printf("holdng key: %d\n", timeouts[i * 8 + j]);
-          layers[layer].second.Enqueue(keys[i * 8 + j], fex::Operation::HOLD, fex::BoundActionEnqueue::DO, xMessageQueue);
+          layers[layer].second.Enqueue(keys[i * 8 + j], fex::Operation::HOLD, fex::BoundActionEnqueue::DO, xEventQueue);
           timeouts[i * 8 + j] = -1;
         }
       }
@@ -422,19 +455,18 @@ static void prvPollKeysTask(void *pvParameters)
             if (pressed)
             {
               printf("fex: pressed??\n");
-              timeouts[i * 8 + j] = xTaskGetTickCount();
+              timeouts[i * 8 + j] = now;
             }
             else
             {
               if (timeouts[i * 8 + j] != -1 && now - timeouts[i * 8 + j] < hold)
               {
-
-                layers[layer].second.Enqueue(keys[i * 8 + j], fex::Operation::PRESS, fex::BoundActionEnqueue::DO, xMessageQueue);
-                layers[layer].second.Enqueue(keys[i * 8 + j], fex::Operation::PRESS, fex::BoundActionEnqueue::UNDO, xMessageQueue);
+                layers[layer].second.Enqueue(keys[i * 8 + j], fex::Operation::PRESS, fex::BoundActionEnqueue::DO, xEventQueue);
+                layers[layer].second.Enqueue(keys[i * 8 + j], fex::Operation::PRESS, fex::BoundActionEnqueue::UNDO, xEventQueue);
               }
-              else
+              else // TODO(fex): holding a key w/o a hold bind sends no key (key is dropped)
               {
-                layers[layer].second.Enqueue(keys[i * 8 + j], fex::Operation::HOLD, fex::BoundActionEnqueue::UNDO, xMessageQueue);
+                layers[layer].second.Enqueue(keys[i * 8 + j], fex::Operation::HOLD, fex::BoundActionEnqueue::UNDO, xEventQueue);
               }
               timeouts[i * 8 + j] = -1;
             }
@@ -442,7 +474,7 @@ static void prvPollKeysTask(void *pvParameters)
           else
           {
             fex::BoundActionEnqueue bae = (pressed) ? fex::BoundActionEnqueue::DO : fex::BoundActionEnqueue::UNDO;
-            layers[layer].second.Enqueue(keys[i * 8 + j], fex::Operation::PRESS, bae, xMessageQueue);
+            layers[layer].second.Enqueue(keys[i * 8 + j], fex::Operation::PRESS, bae, xEventQueue);
           }
         }
 
@@ -519,7 +551,7 @@ static void send_hid_report()
   static uint8_t mouse_buttons = 0;
 
   fex::QueueMessage msg;
-  if (xQueueReceive(xMessageQueue, (void *)&msg, 0) != pdTRUE)
+  if (xQueueReceive(xEventQueue, (void *)&msg, 0) != pdTRUE)
   {
     return;
   }
@@ -767,4 +799,11 @@ static void prvHardwareInit(void)
   gpio_set_dir(PICO_DEFAULT_LED_PIN, 1);
   gpio_put(PICO_DEFAULT_LED_PIN, !PICO_DEFAULT_LED_PIN_INVERTED);
   board_init();
+
+  // init i2c
+  i2c_init(i2c1, 400 * 1000);
+  gpio_set_function(6, GPIO_FUNC_I2C);
+  gpio_set_function(7, GPIO_FUNC_I2C);
+  gpio_pull_up(6);
+  gpio_pull_up(7);
 }
